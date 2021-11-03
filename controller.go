@@ -10,6 +10,7 @@ import (
 	"log"
 	"net"
 	"strings"
+	"sync"
 	"text/template"
 	"time"
 
@@ -36,20 +37,13 @@ type Controller struct {
 	nodeHeartbeatTemplate      string
 	nodeInitializationTemplate string
 	funcMap                    template.FuncMap
+	futurePatches			   map[string]string
+	futurePatchesLock		   sync.Mutex
 }
 
 type GrpcServer struct {
 	controller *Controller
 	proto.UnimplementedFakekubeletServer
-}
-
-func (server *GrpcServer) PatchFuturePodStatus(
-	ctx context.Context,
-	msg *proto.PatchPodStatusMsg,
-) (*emptypb.Empty, error) {
-	log.Printf("Patching %s:%s with => %s", msg.Namespace, msg.PodName, msg.Patch)
-
-	return &emptypb.Empty{}, nil
 }
 
 func (server *GrpcServer) PatchPodStatus(
@@ -61,8 +55,9 @@ func (server *GrpcServer) PatchPodStatus(
 	pod, err := server.controller.clientSet.CoreV1().Pods(msg.Namespace).Get(
 		ctx, msg.PodName, metav1.GetOptions{})
 	if err != nil {
-		log.Printf("Error getting pod: %+v", err)
-		return &emptypb.Empty{}, err
+		log.Printf("Could not get pod, assuming this is a future patch: %+v", err)
+		server.controller.storeFuturePatch(msg.Namespace, msg.PodName, msg.Patch)
+		return &emptypb.Empty{}, nil
 	}
 	log.Printf("Got pod %s", pod.Name)
 
@@ -143,6 +138,7 @@ func NewController(
 		statusTemplate:             statusTemplate,
 		nodeHeartbeatTemplate:      nodeHeartbeatTemplate,
 		nodeInitializationTemplate: nodeInitializationTemplate,
+		futurePatches: map[string]string{},
 	}
 	n.funcMap = template.FuncMap{
 		"Now": func() string {
@@ -182,6 +178,26 @@ func RunGrpcServer(controller *Controller) {
 			log.Fatalf("failed to serve: %v", err)
 		}
 	}()
+}
+
+func (c *Controller) storeFuturePatch(ns string, name string, patch string) {
+	c.futurePatchesLock.Lock()
+	defer c.futurePatchesLock.Unlock()
+
+	key := ns + ":" + name
+	c.futurePatches[key] = patch
+}
+
+func (c *Controller) popFuturePatch(ns string, name string) (string, bool) {
+	c.futurePatchesLock.Lock()
+	defer c.futurePatchesLock.Unlock()
+
+	key := ns + ":" + name
+	val, ok :=  c.futurePatches[key]
+	if ok {
+		delete(c.futurePatches, key)
+	}
+	return val, ok
 }
 
 func (c *Controller) deletePod(ctx context.Context, pod *corev1.Pod) error {
@@ -400,6 +416,20 @@ func (c *Controller) configurePod(pod *corev1.Pod, ctx context.Context) (bool, e
 	}
 
 	merge := c.statusTemplate
+	patched, err2 := patchPodStatus(pod, merge, c)
+
+	customPatch, ok := c.popFuturePatch(pod.Namespace, pod.Name)
+	if ok {
+		patched, err2 = patchPodStatus(pod, customPatch, c)
+		if err2 != nil {
+			log.Printf("Error patching with custom patch %v", err2)
+		}
+	}
+
+	return patched, err2
+}
+
+func patchPodStatus(pod *corev1.Pod, merge string, c *Controller) (bool, error) {
 	if m, ok := pod.Annotations[mergeLabel]; ok && strings.TrimSpace(m) != "" {
 		merge = m
 	}

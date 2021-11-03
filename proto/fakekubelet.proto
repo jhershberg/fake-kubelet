@@ -5,7 +5,6 @@ option go_package="fake_kuebelet/proto";
 
 service fakekubelet {
   rpc PatchPodStatus (PatchPodStatusMsg) returns (google.protobuf.Empty) {}
-  rpc PatchFuturePodStatus (PatchPodStatusMsg) returns (google.protobuf.Empty) {}
 }
 
 message PatchPodStatusMsg {
